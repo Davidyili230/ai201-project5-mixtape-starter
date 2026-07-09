@@ -163,3 +163,42 @@ by recency at all (per its own docstring) — it was untouched by this change an
 events regardless of age, so I didn't regress the unfiltered activity feed while fixing the
 filtered "listening now" feed. Full `pytest tests/` suite still passes (no test file exists yet
 for `feed_service.py` in the starter — see the regression test I added below).
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it.** I ran the app against the real seed data and looked at the seeded
+"Friday Energy" playlist (7 songs per `seed_data.py`). Querying `playlist_entries` directly
+confirmed 7 rows exist for that playlist, but calling `playlist_service.get_playlist_songs()`
+returned only 6 — missing "Harlem Renaissance," the song at the highest `position`. I then
+reproduced darius's second observation (adding a song "frees" the previously-missing one): I
+inserted a new `playlist_entries` row for a brand-new song at `position=8` and re-fetched — the
+previously-missing "Harlem Renaissance" reappeared, and the newly-added song became the new
+missing entry, exactly matching the report. (Note: attempting this over the real HTTP
+`POST /playlists/<id>/songs` endpoint hits a separate, pre-existing 500 error unrelated to this
+issue — `notification_service.add_to_playlist()` appends to `playlist.songs` via the bare ORM
+relationship, which never populates the NOT-NULL `position`/`added_by` columns on
+`playlist_entries`. That's a real bug but not one of the five reported issues, so I didn't fix it
+as part of this task; I inserted the row directly via SQLAlchemy Core to isolate and verify the
+read-side bug in `get_playlist_songs()`.)
+
+**How I found the root cause.** `routes/playlists.py::get_songs()` calls
+`playlist_service.get_playlist_songs()` directly. Reading the function, it builds a query joining
+`Song` to `playlist_entries`, filters by `playlist_id`, and orders by `position` — all correct —
+and assigns the result to `songs`. The very next line is
+`return [song.to_dict() for song in songs[:-1]]`. That `[:-1]` slice was the moment I was
+confident I'd found it: `songs` at that point is already the fully correct, ordered list from the
+query above; the function then explicitly drops its own last element before returning. Nothing
+upstream of that line needed to change.
+
+**The root cause.** `get_playlist_songs()` sliced off the last element of the correctly-ordered
+song list (`songs[:-1]`) before returning it. Since the list is ordered ascending by `position`,
+"last element" always means "highest position," i.e. the most recently added song — which is
+exactly the pattern darius described: whichever song was added most recently is always the one
+hidden, and adding a new song just moves that title to a new most-recent slot.
+
+**My fix and side-effect check.** Changed the return statement to `songs` (no slice). Verified:
+(1) the 7-song seeded playlist now returns all 7, ending with "Harlem Renaissance"; (2) after
+adding an 8th song directly, all 8 are returned including the new one, with no song hidden;
+(3) ran the existing `tests/test_playlists.py::test_empty_playlist_returns_empty_list` to confirm
+the boundary on the *other* side — an empty playlist still correctly returns `[]`. Full
+`pytest tests/` suite passes, 13/13, with no other files touched.
