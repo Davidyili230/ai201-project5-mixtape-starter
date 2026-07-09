@@ -356,3 +356,7 @@ Added `tests/test_feed.py` for Issue #2, since `feed_service.py` had no test fil
   1am today (less than 24 hours old *and* today) still appears.
 - `test_no_friends_returns_empty_list` — an existing edge case (no friends) that the fix must not
   break.
+
+## Commit History Screenshot
+
+![git log --oneline on bugfix/mixtape](log.png)
