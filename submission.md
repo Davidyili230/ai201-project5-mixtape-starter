@@ -202,3 +202,39 @@ adding an 8th song directly, all 8 are returned including the new one, with no s
 (3) ran the existing `tests/test_playlists.py::test_empty_playlist_returns_empty_list` to confirm
 the boundary on the *other* side — an empty playlist still correctly returns `[]`. Full
 `pytest tests/` suite passes, 13/13, with no other files touched.
+
+### Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it.** Using the real seeded data, I found a song shared by darius, recorded
+his notification count (0), then called `notification_service.rate_song(kenji.id, song.id, 5)` —
+the same call `POST /songs/<id>/rate` makes. The `Rating` was saved correctly (`rating.score == 5`),
+but darius's notification count stayed at 0. That matches aaliya's exact report: rating is saved
+and visible on the song, but no notification ever appears.
+
+**How I found the root cause.** The hint pointed at comparing the working notification pattern to
+the missing one, so I read both functions in `notification_service.py` side by side.
+`add_to_playlist()` ends with: check `if song.shared_by != added_by_user_id:` then call
+`create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", body=...)`.
+`rate_song()` upserts the `Rating`, commits, and `return`s — there is no call to
+`create_notification` anywhere in the function. This wasn't a subtle typo to spot; it was the
+absence of a step that every other notification-producing function has. That's what the brief
+meant by "architectural, not a typo" — the codebase's convention is that each action that should
+notify someone needs its own explicit `create_notification()` call, and that step was simply never
+written for ratings.
+
+**The root cause.** `rate_song()` never calls `create_notification()`. Every other user-facing
+action that's supposed to produce a notification (`add_to_playlist`) explicitly constructs one
+after committing its primary side effect; `rate_song()` stops after committing the `Rating` and
+returns without doing the equivalent step. There's no shared hook, signal, or event system that
+would have created the notification automatically — so simply saving the rating was never going
+to produce one.
+
+**My fix and side-effect check.** Added the same pattern used in `add_to_playlist()`: after
+committing the rating, if `song.shared_by != user_id` (don't notify someone for rating their own
+song), call `create_notification(user_id=song.shared_by, notification_type="song_rated", body=...)`.
+Verified: (1) a friend rating another user's shared song now produces exactly one notification
+with the expected body text and `type: "song_rated"`; (2) a user rating their *own* shared song
+produces no notification (mirrors the existing self-add guard in `add_to_playlist`); (3) re-ran the
+`add_to_playlist` flow against seeded data to confirm the pre-existing "song added to playlist"
+notification path is untouched and still fires correctly; (4) full `pytest tests/` suite still
+passes, 13/13.
