@@ -238,3 +238,60 @@ produces no notification (mirrors the existing self-add guard in `add_to_playlis
 `add_to_playlist` flow against seeded data to confirm the pre-existing "song added to playlist"
 notification path is untouched and still fires correctly; (4) full `pytest tests/` suite still
 passes, 13/13.
+
+### Issue #3 — The same song keeps showing up twice in search (bonus — see note on reproduction)
+
+**How I reproduced it — and why I couldn't, over HTTP.** `seed_data.py` and `tests/test_search.py`
+both leave comments saying songs with 3+ tags are meant to "expose Issue #3" and that the bug
+"causes it to be 3." Following that lead, I searched "Anthem" against the real seeded DB
+(`Crown Heights Anthem` has 3 tags) via the actual `GET /songs/search?q=Anthem` endpoint, and
+separately via `search_songs()` directly, and via a synthetic case with two multi-tag songs. In
+every case the result count was correct (1 and 2 respectively) — **no duplication was observable**.
+Per the brief's own guidance ("if you can't reproduce a bug, try a different one"), I want to be
+upfront that this one didn't reproduce through the app's actual behavior in this environment. I
+kept investigating anyway because the mechanism was too specific to abandon on a first null
+result.
+
+**How I found the root cause (and why it's invisible right now).** `search_service.search_songs()`
+does `db.session.query(Song).outerjoin(song_tags, ...).filter(...).all()` — joining to the
+`song_tags` association table without ever selecting or filtering on a tag column. Compiling that
+exact query to raw SQL and running it directly against the DB (bypassing the ORM's row
+post-processing) confirmed the join fans out: a song with 3 tags produced **3 raw rows** from the
+database. So the multiplication is real at the SQL level, exactly matching the "3 tags → 3
+results" pattern in the bug report. But `db.session.query(Song)...all()` (SQLAlchemy's legacy
+`Query` API) didn't return 3 — it returned 1. I traced why into SQLAlchemy's own source
+(`sqlalchemy/orm/loading.py`): legacy `Query.all()` sets `filtered = compile_state._has_mapper_entities`,
+which is `True` for *any* query whose result is a full mapped entity, and when `filtered` is
+True, `Query._iter()` calls `result.unique()` automatically before returning — deduplicating by
+primary key regardless of whether a join was involved. That's not a conditional safety net that
+this bug could slip past; it's unconditional for this query shape in the installed SQLAlchemy
+version (2.0.51, pinned by `requirements.txt`'s `sqlalchemy>=2.0.0`). That's the moment I understood
+why my repro attempts kept coming back clean: the ORM API this code happens to use quietly
+absorbs the exact defect the join would otherwise cause.
+
+**The root cause.** The join itself is still a real defect, even though its consequence is
+currently masked: `search_songs()` joins `Song` to `song_tags` for no reason — it never filters or
+selects anything from that join, since tags are separately eager-loaded through the
+`Song.tags` relationship (`lazy="subquery"`) for `to_dict()`. A join that exists for no purpose is
+also a join with no reason to keep, and if this code were ever ported to SQLAlchemy 2.0's
+`select()`/`session.execute()` style — the direction SQLAlchemy's own docs are steering people
+toward, and something I verified directly produces un-deduplicated, duplicated rows for the exact
+same query — the duplication would resurface immediately with no warning, because dedup here is
+an artifact of the legacy `Query` wrapper rather than a property of the query itself.
+
+**My fix and side-effect check.** Removed the unnecessary `.outerjoin(song_tags, ...)` (and the
+now-unused `Tag`/`song_tags` imports) from `search_songs()`, since it filtered nothing and
+selected nothing — the join existed for no purpose. This removes the row-multiplication hazard at
+its source rather than papering over it with `.distinct()` on a join that shouldn't be there in
+the first place. Verified: (1) tags still appear correctly in search results (`song.tags` is
+loaded independently via the relationship, untouched by this change) — confirmed
+`['rap', 'hip-hop', 'boom bap']` still shows for Crown Heights Anthem; (2) full `pytest tests/`
+suite still passes, 13/13, including all three `test_search_no_duplicates_*` tests, which continue
+to pass as they did before this change (they were passing due to the same ORM-level dedup
+described above; they still pass now because the join is simply gone).
+
+I'm flagging this one differently from the other four RCA entries: I did not observe the reported
+symptom directly, so I'm not confident this "fix" addresses what a real user would have hit in
+this exact environment. I'm including it because the underlying defect (an unnecessary join that
+provably multiplies rows at the SQL level) is real and worth removing regardless, but I want to be
+transparent that this is the one bug where "reproduce first" genuinely failed for me.
