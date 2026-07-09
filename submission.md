@@ -295,3 +295,19 @@ symptom directly, so I'm not confident this "fix" addresses what a real user wou
 this exact environment. I'm including it because the underlying defect (an unnecessary join that
 provably multiplies rows at the SQL level) is real and worth removing regardless, but I want to be
 transparent that this is the one bug where "reproduce first" genuinely failed for me.
+
+## Regression Test
+
+Added `tests/test_feed.py` for Issue #2, since `feed_service.py` had no test file in the starter
+(unlike streaks, search, and playlists, which already had one). It covers:
+
+- `test_yesterday_evening_listen_does_not_show_today` — a friend's 11pm-yesterday listen must not
+  appear in "listening now" this morning. I confirmed this test actually catches the original bug:
+  temporarily restoring the pre-fix `feed_service.py` (rolling 24-hour window) and re-running the
+  suite makes exactly this test fail with `assert [...] == []`, while it passes against the fixed
+  version — i.e. this is a genuine regression test, not just an assertion that happens to match
+  the current code.
+- `test_todays_early_morning_listen_shows_up` — the other side of the boundary: a listen from
+  1am today (less than 24 hours old *and* today) still appears.
+- `test_no_friends_returns_empty_list` — an existing edge case (no friends) that the fix must not
+  break.
