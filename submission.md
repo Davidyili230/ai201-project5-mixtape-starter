@@ -124,3 +124,42 @@ from a Monday start (`update_listening_streak` called once per consecutive calen
 `pytest tests/` suite — including `test_streak_does_not_double_count_same_day` and
 `test_streak_resets_after_skipped_day`, which exercise the same-day and skipped-day branches this
 change didn't touch — all still pass, confirming the fix is scoped to the Sunday case only.
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it.** I wrote a script that creates two friended users (nova, darius), a song,
+and one `ListeningEvent` for darius at 11pm "yesterday" (computed as `now - 1 day` with the hour
+forced to 23:00). I then called `feed_service.get_friends_listening_now(nova.id)` with the real
+current time (no time-travel needed — this is nova's actual "check my feed this morning" moment,
+just replayed a few hours later in wall-clock terms). Result: darius's stale event still appeared
+in the feed, matching nova's exact report of seeing "darius listening now" to something he played
+the night before.
+
+**How I found the root cause.** `routes/feed.py::listening_now()` calls
+`feed_service.get_friends_listening_now()` directly — a short, single-purpose function, so I read
+it in full. It builds `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` and filters
+`ListeningEvent.listened_at >= cutoff`, with `RECENT_THRESHOLD = timedelta(hours=24)`. The moment
+I was confident this was the actual bug (not just "something about recency filtering") was doing
+the arithmetic on the report itself: darius listened at 11pm, nova checked at 9am — only 10 hours
+apart, well inside a 24-hour window, so of course the filter kept it. The word "today" in the
+feature's intent ("what my friends played today") and the word "24 hours" in the implementation
+are two different definitions of "recent," and the code implements the wrong one.
+
+**The root cause.** `RECENT_THRESHOLD` is a rolling 24-hour window measured backward from the
+current instant, not a calendar-day boundary. An event from 11pm one night stays inside that
+rolling window until 11pm the *next* night — which is exactly the symptom nova described
+("hangs around until the same time the next day"). The feature is supposed to mean "listened
+today," a boundary that resets at midnight, but the code implements "listened in the last 24
+hours," a boundary that slides forward continuously with `now`.
+
+**My fix and side-effect check.** Changed the cutoff computation from `now - timedelta(hours=24)`
+to the start of the current UTC calendar day (`now.replace(hour=0, minute=0, second=0,
+microsecond=0)`), and removed the now-unused `RECENT_THRESHOLD` constant/import. I verified both
+sides of the boundary directly: an event at 11pm "yesterday" now returns 0 feed entries, and an
+event at 1am "today" (only 2 hours after midnight, but still today) returns 1 — confirming the
+cutoff is a calendar-day boundary and not simply a shorter rolling window. I also re-ran
+`get_activity_feed()`, the other function in the same file, which intentionally does *not* filter
+by recency at all (per its own docstring) — it was untouched by this change and still returns
+events regardless of age, so I didn't regress the unfiltered activity feed while fixing the
+filtered "listening now" feed. Full `pytest tests/` suite still passes (no test file exists yet
+for `feed_service.py` in the starter — see the regression test I added below).
