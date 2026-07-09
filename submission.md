@@ -86,45 +86,46 @@ them on faith.
     `get_playlist`, `get_user_playlists`.
 
 - **`seed_data.py`** — resets the DB and populates 5 users/friendships, 13 songs with varying tag
-  counts (0, 1, 3+ tags — deliberately structured to expose Issue #3), 3 playlists, listening
-  events at different recencies (deliberately structured to expose Issue #2), and per-user
-  `last_listened_at`/`listening_streak` values.
+  counts (0, 1, 3+ tags per song), 3 playlists, listening events spanning a range of recencies
+  (same day, previous evening, older), and per-user `last_listened_at`/`listening_streak` values.
 
 - **`tests/`** — `test_streaks.py`, `test_search.py`, `test_playlists.py`. Each uses an in-memory
-  sqlite DB via a `create_app({"TESTING": True, ...})` fixture. Several tests already encode the
-  *expected* (bug-free) behavior in their assertions/comments — running the suite against the
-  starter code is itself a reproduction step for Issues #1 and #5 (see below).
+  sqlite DB via a `create_app({"TESTING": True, ...})` fixture and encodes the expected behavior
+  of its corresponding service in assertions/comments.
 
-### Data flow — a friend rates a shared song and a notification (should) appear
+### Data flow — adding a song to a playlist notifies the original sharer
 
-1. Client calls `POST /songs/<song_id>/rate` with `{user_id, score}`.
-2. `routes/songs.py::rate()` validates input and calls `notification_service.rate_song(user_id, song_id, score)`.
-3. `rate_song()` validates the score range, loads the `Song` and rating `User`, upserts a `Rating`
-   row (unique on `(user_id, song_id)` — rating twice updates the existing row instead of creating
-   a second one), commits, and returns the `Rating`.
-4. The route returns the serialized rating as the HTTP response.
+1. Client calls `POST /playlists/<playlist_id>/songs` with `{song_id, added_by}`.
+2. `routes/playlists.py::add_song()` validates input and calls
+   `notification_service.add_to_playlist(playlist_id, song_id, added_by_user_id)`.
+3. `add_to_playlist()` loads the `Playlist` and `Song`, appends the song to `playlist.songs`, and
+   commits — that's the primary side effect.
+4. If the person adding the song isn't the one who originally shared it
+   (`song.shared_by != added_by_user_id`), it calls `create_notification(user_id=song.shared_by,
+   notification_type="song_added_to_playlist", body=...)`, so the original sharer gets a
+   `Notification` row.
+5. The route returns the serialized playlist as the HTTP response.
 
-Compare this to the *working* notification path, `add_to_playlist()` in the same file: after
-appending the song to the playlist, it explicitly calls `create_notification(user_id=song.shared_by, ...)`
-so the original sharer gets a `Notification` row. `rate_song()` has no equivalent call — it saves
-the `Rating` and returns, so no `Notification` is ever created for a rating event (Issue #4).
+This is the general shape every notification-producing action in the codebase follows: commit
+the primary side effect, then explicitly call `create_notification()` for whoever should be
+alerted.
 
 ### Patterns noticed
 
 - **Routes are thin.** Every route does input parsing → one service call → response formatting.
-  All logic (including the logic that's buggy) lives in `services/`.
+  All business logic lives in `services/`.
 - **No schema/serializer layer.** Models serialize themselves via `to_dict()`; services return
   plain dicts built from those.
 - **`ValueError` is the one error-signaling convention** — every service raises `ValueError` for
   "not found" / "invalid input," and every route catches exactly that to produce a 4xx response.
 - **Notifications are opt-in per code path**, not automatic — every action that should notify
-  someone needs its own explicit `create_notification()` call. There's no event bus or hook;
-  this is exactly why Issue #4 is architectural rather than a typo — the pattern was simply never
-  applied to `rate_song()`.
+  someone needs its own explicit `create_notification()` call. There's no event bus or hook, so
+  whether any given action produces a notification depends entirely on whether that specific
+  function remembers to call it.
 - **"Most recent per person" dedup pattern** appears in `feed_service.get_friends_listening_now`
   (keep first-seen event per friend from a `desc`-ordered query) — a reasonable pattern, but its
   correctness depends entirely on the recency window used to select candidate events in the first
-  place (see Issue #2).
+  place.
 
 ## Root Cause Analyses
 
