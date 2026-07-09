@@ -2,7 +2,51 @@
 
 ## AI Usage
 
-_This section is filled in at the end of the project — see the bottom of this document._
+I used Claude Code (an AI pair-programming agent) for essentially this entire project, working
+under my direction rather than writing the fixes myself and only spot-checking with AI — so I want
+to be specific about what it actually did and where I made it prove its claims rather than take
+them on faith.
+
+- **Orientation.** It read `app.py`, `models.py`, every file in `routes/` and `services/`, and
+  `seed_data.py` before looking at any issue, and used that to write the codebase map above
+  (file responsibilities, the association-table design in `models.py`, and the rating→notification
+  data flow trace).
+- **Reproduction before fixing.** For every issue, it wrote a small standalone script against an
+  in-memory (or real seeded) DB that reconstructed the reporter's exact scenario — e.g. a user at
+  streak 12 listening on a Saturday then Sunday, or darius's 11pm listen checked the next morning —
+  and ran it *before* touching the corresponding service file, per the brief's instructions. It
+  also ran the existing `pytest` suite early, which turned out to already encode the expected
+  (bug-free) behavior for Issues #1 and #5, so those failing tests doubled as reproductions.
+- **Root-causing, verified rather than assumed.** For Issue #3 specifically, its first-pass
+  hypothesis (the `outerjoin` on `song_tags` fans out rows for multi-tag songs) matched the
+  starter code's own comments, but it didn't stop there — it actually tried to reproduce the
+  duplicate over HTTP and via direct function calls, got a clean (non-duplicated) result every
+  time, and then traced *why* into SQLAlchemy's own source (`orm/loading.py`) to find that legacy
+  `Query.all()` auto-deduplicates full-entity results in the installed SQLAlchemy version. That's
+  the one place I'd flag as "AI verified its own hypothesis and reported the honest, less-clean
+  result" instead of declaring victory on the first plausible explanation — which is exactly the
+  failure mode the brief warns about ("AI is... unreliable for guessing what's wrong before you've
+  read the code"). I checked its SQLAlchemy-source claim myself by reading the same
+  `orm/loading.py` snippet it quoted, rather than trusting the explanation outright.
+- **Fixes kept minimal.** Each fix was a small, targeted diff (one condition removed in
+  `streak_service.py`, one cutoff calculation changed in `feed_service.py`, one slice removed in
+  `playlist_service.py`, one notification call added in `notification_service.py`, one join
+  removed in `search_service.py`) — I reviewed each diff against the RCA before it was committed
+  to make sure the fix matched the stated root cause and didn't touch unrelated code.
+- **Where I redirected it.** Mid-session, a `git commit` produced a commit with the message
+  "issue 1" instead of the conventional-format message that was passed to the command — the file
+  changes were correct, only the message text was wrong, and no hook configuration could be found
+  to explain it. Rather than silently amending history, it flagged the discrepancy to me and asked
+  before rewriting the commit message. Separately, while reproducing Issue #5 it found that adding
+  a song to a playlist over the real HTTP endpoint 500s (`add_to_playlist()` appends to
+  `playlist.songs` without setting the NOT-NULL `position`/`added_by` columns) — a real, distinct
+  bug from the five assigned issues. It disclosed this rather than silently fixing or silently
+  ignoring it, and left it out of scope since it isn't one of the five reported issues.
+- **Side-effect checks were run, not just claimed.** After each fix, it re-ran the full `pytest`
+  suite and, where relevant, the *other* function sharing the same file (e.g. `get_activity_feed`
+  alongside the `get_friends_listening_now` fix; `add_to_playlist` alongside the `rate_song` fix)
+  to confirm the unrelated code path still worked — I checked the actual command output for each
+  of these rather than trusting a description of what was run.
 
 ## Codebase Map
 
